@@ -12,7 +12,7 @@ use Glpi\Plugin\Hooks;
 use GlpiPlugin\Loandashboard\Cards;
 use GlpiPlugin\Loandashboard\Menu;
 
-define('PLUGIN_LOANDASHBOARD_VERSION', '1.0.0');
+define('PLUGIN_LOANDASHBOARD_VERSION', '1.1.0');
 
 function plugin_init_loandashboard()
 {

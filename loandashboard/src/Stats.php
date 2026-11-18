@@ -13,17 +13,82 @@ use Search;
 class Stats
 {
     private static ?array $pool = null;
+    private static ?array $base = null;
     private static ?int $statusOption = null;
+
+    /** Dashboard filters: group (0 = settings), model, location (0 = all). */
+    private static array $filters = ['group' => 0, 'model' => 0, 'location' => 0];
+
+    public static function setFilters(array $f): void
+    {
+        self::$filters = [
+            'group'    => max(0, (int) ($f['group'] ?? 0)),
+            'model'    => max(0, (int) ($f['model'] ?? 0)),
+            'location' => max(0, (int) ($f['location'] ?? 0)),
+        ];
+        self::$pool = null;
+        self::$base = null;
+    }
+
+    public static function filters(): array
+    {
+        return self::$filters;
+    }
+
+    /** Pool after the model / location filters. */
+    public static function pool(): array
+    {
+        if (self::$pool !== null) {
+            return self::$pool;
+        }
+        $f = self::$filters;
+        return self::$pool = array_filter(self::basePool(), static fn($c) =>
+            ($f['model'] === 0 || $c['models_id'] === $f['model'])
+            && ($f['location'] === 0 || $c['locations_id'] === $f['location']));
+    }
+
+    /** Values for the model / location dropdowns (from the group pool, before those two filters). */
+    public static function options(string $field): array
+    {
+        $id = $field === 'model' ? 'models_id' : 'locations_id';
+        $label = $field === 'model' ? 'model' : 'location';
+        $out = [];
+        foreach (self::basePool() as $c) {
+            if ($c[$id] > 0) {
+                $out[$c[$id]] = $c[$label] !== '' ? $c[$label] : '#' . $c[$id];
+            }
+        }
+        asort($out, SORT_NATURAL | SORT_FLAG_CASE);
+        return $out;
+    }
+
+    /** Groups that contain computers (for the group filter). */
+    public static function groupOptions(): array
+    {
+        global $DB;
+        $out = [];
+        foreach ($DB->request([
+            'SELECT'     => ['glpi_groups.id', 'glpi_groups.completename', 'COUNT' => 'glpi_groups_items.id AS cpt'],
+            'FROM'       => 'glpi_groups',
+            'INNER JOIN' => ['glpi_groups_items' => ['ON' => ['glpi_groups' => 'id', 'glpi_groups_items' => 'groups_id']]],
+            'WHERE'      => ['glpi_groups_items.itemtype' => 'Computer'],
+            'GROUPBY'    => ['glpi_groups.id', 'glpi_groups.completename'],
+            'ORDER'      => 'glpi_groups.completename',
+        ]) as $g) {
+            $out[(int) $g['id']] = $g['completename'] . ' (' . (int) $g['cpt'] . ')';
+        }
+        return $out;
+    }
 
     /* -------------------------------------------------------------- pool */
 
-    /** Computers in the loan pool (all computers when no group is set). */
-    public static function pool(): array
+    /** Computers in the loan pool (group filter or settings; all computers when no group is set). */
+    private static function basePool(): array
     {
         global $DB;
 
-        if (self::$pool !== null) {
-            return self::$pool;
+        if (self::$base !== null) {
+            return self::$base;
         }
 
         $where = [
@@ -34,7 +99,7 @@ class Stats
             $where += getEntitiesRestrictCriteria('glpi_computers', '', '', true);
         }
 
-        $groups = Settings::ids('groups');
+        $groups = self::$filters['group'] > 0 ? [self::$filters['group']] : Settings::ids('groups');
         if ($groups !== []) {
             $ids = [];
             foreach ($DB->request([
@@ -49,7 +114,7 @@ class Stats
                 $ids[(int) $r['items_id']] = true;
             }
             if ($ids === []) {
-                return self::$pool = [];
+                return self::$base = [];
             }
             $where['glpi_computers.id'] = array_keys($ids);
         }
@@ -59,6 +124,7 @@ class Stats
             'SELECT'    => [
                 'glpi_computers.id', 'glpi_computers.name', 'glpi_computers.serial',
                 'glpi_computers.states_id', 'glpi_computers.users_id', 'glpi_computers.contact',
+                'glpi_computers.computermodels_id', 'glpi_computers.locations_id',
                 'glpi_states.name AS state', 'glpi_computermodels.name AS model',
                 'glpi_manufacturers.name AS manufacturer', 'glpi_locations.completename AS location',
                 'glpi_users.name AS login', 'glpi_users.firstname', 'glpi_users.realname',
@@ -91,9 +157,11 @@ class Stats
                 'location'  => (string) ($r['location'] ?? ''),
                 'user'      => $user,
                 'kind'      => self::kind((int) $r['states_id']),
+                'models_id'    => (int) $r['computermodels_id'],
+                'locations_id' => (int) $r['locations_id'],
             ];
         }
-        return self::$pool = $rows;
+        return self::$base = $rows;
     }
 
     /** available | loaned | damaged | other */
@@ -117,6 +185,12 @@ class Stats
         $usable = $t['total'] - $t['damaged'];
         $t['utilisation'] = $usable > 0 ? (int) round($t['loaned'] * 100 / $usable) : 0;
         return $t;
+    }
+
+    /** Devices on loan for more than $days days. */
+    public static function overdueCount(int $days): int
+    {
+        return count(self::listOf('loaned', $days));
     }
 
     /** [label => count], sorted by count. */
@@ -176,7 +250,7 @@ class Stats
     }
 
     /** Status changes of pool computers since $since (oldest first). */
-    private static function statusChanges(string $since): array
+    private static function statusChanges(string $since, string $until = ''): array
     {
         global $DB;
 
@@ -193,8 +267,8 @@ class Stats
                 'itemtype'         => 'Computer',
                 'items_id'         => $ids,
                 'id_search_option' => self::statusOption(),
-                'date_mod'         => ['>=', $since],
-            ],
+                ['date_mod' => ['>=', $since]],
+            ] + ($until !== '' ? [['date_mod' => ['<=', $until]]] : []),
             'ORDER'  => 'date_mod ASC',
         ]) as $r) {
             $sid = (int) ($r['new_id'] ?? 0);
@@ -221,11 +295,21 @@ class Stats
     {
         $months = max(1, min(36, $months));
         $start  = new \DateTimeImmutable('first day of this month 00:00:00');
-        $start  = $start->modify('-' . ($months - 1) . ' months');
+        return self::monthlyRange($start->modify('-' . ($months - 1) . ' months'), new \DateTimeImmutable('now'));
+    }
+
+    /** Same as monthly(), for a date range (e.g. a school year). */
+    public static function monthlyRange(\DateTimeImmutable $from, \DateTimeImmutable $to): array
+    {
+        $start = $from->modify('first day of this month')->setTime(0, 0);
+        $end   = $to->setTime(23, 59, 59);
+        if ($end < $start) {
+            [$start, $end] = [$end->modify('first day of this month')->setTime(0, 0), $from->setTime(23, 59, 59)];
+        }
 
         $keys = [];
-        for ($i = 0; $i < $months; $i++) {
-            $keys[] = $start->modify("+{$i} months")->format('Y-m');
+        for ($m = $start; $m <= $end && count($keys) < 60; $m = $m->modify('+1 month')) {
+            $keys[] = $m->format('Y-m');
         }
         $series = ['loaned' => [], 'available' => [], 'damaged' => []];
         foreach ($series as $k => $_) {
@@ -233,7 +317,7 @@ class Stats
         }
 
         $perDevice = [];
-        foreach (self::statusChanges($start->format('Y-m-d H:i:s')) as $ch) {
+        foreach (self::statusChanges($start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s')) as $ch) {
             $m = substr($ch['date'], 0, 7);
             if (isset($series[$ch['kind']][$m])) {
                 $series[$ch['kind']][$m]++;
@@ -343,7 +427,7 @@ class Stats
     }
 
     /** Devices of one kind with user, e-mail and since date. */
-    public static function listOf(string $kind): array
+    public static function listOf(string $kind, int $minDays = 0): array
     {
         $rows = array_values(array_filter(self::pool(), static fn($c) => $kind === 'all' || $c['kind'] === $kind));
         $ids  = array_column($rows, 'id');
@@ -356,6 +440,9 @@ class Stats
             $r['email'] = $emails[$r['id']] ?? '';
         }
         unset($r);
+        if ($minDays > 0) {
+            $rows = array_values(array_filter($rows, static fn($r) => $r['days'] !== null && $r['days'] > $minDays));
+        }
         usort($rows, static fn($a, $b) => ($b['days'] ?? -1) <=> ($a['days'] ?? -1));
         return $rows;
     }

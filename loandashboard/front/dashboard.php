@@ -13,15 +13,84 @@ Session::checkRight('computer', READ);
 
 global $CFG_GLPI;
 
-$views  = ['loaned' => 'On loan', 'available' => 'Available', 'damaged' => 'Damaged', 'other' => 'Other status', 'all' => 'All loan devices'];
-$view   = isset($views[$_GET['view'] ?? '']) ? $_GET['view'] : 'loaned';
-$months = (int) ($_GET['months'] ?? 12);
-$months = in_array($months, [3, 6, 12, 24], true) ? $months : 12;
-$self   = Menu::getSearchURL();
+$self = Menu::getSearchURL();
+
+/* --------------------------------------------------------------- filters */
+$days = max(1, min(365, (int) ($_GET['days'] ?? 30)));
+$views = [
+    'loaned'    => 'On loan',
+    'overdue'   => 'On loan > ' . $days . ' days',
+    'available' => 'Available',
+    'damaged'   => 'Damaged',
+    'other'     => 'Other status',
+    'all'       => 'All loan devices',
+];
+$view = isset($views[$_GET['view'] ?? '']) ? (string) $_GET['view'] : 'loaned';
+
+$periods = [
+    '3'      => 'Last 3 months',
+    '6'      => 'Last 6 months',
+    '12'     => 'Last 12 months',
+    '24'     => 'Last 24 months',
+    'sy'     => 'This school year',
+    'lsy'    => 'Last school year',
+    'custom' => 'Custom dates',
+];
+$period = (string) ($_GET['period'] ?? ($_GET['months'] ?? '12'));
+$period = isset($periods[$period]) ? $period : '12';
+
+$now   = new DateTimeImmutable('today');
+$valid = static function ($v): ?DateTimeImmutable {
+    $d = DateTimeImmutable::createFromFormat('!Y-m-d', (string) $v);
+    return $d !== false ? $d : null;
+};
+// school year = 1 September - 30 June
+$syStart = (int) $now->format('n') >= 9 ? (int) $now->format('Y') : (int) $now->format('Y') - 1;
+switch ($period) {
+    case 'sy':
+        $from = new DateTimeImmutable($syStart . '-09-01');
+        $to   = min($now, new DateTimeImmutable(($syStart + 1) . '-06-30'));
+        break;
+    case 'lsy':
+        $from = new DateTimeImmutable(($syStart - 1) . '-09-01');
+        $to   = new DateTimeImmutable($syStart . '-06-30');
+        break;
+    case 'custom':
+        $from = $valid($_GET['from'] ?? '') ?? $now->modify('-11 months')->modify('first day of this month');
+        $to   = $valid($_GET['to'] ?? '') ?? $now;
+        if ($to < $from) {
+            [$from, $to] = [$to, $from];
+        }
+        break;
+    default:
+        $from = $now->modify('first day of this month')->modify('-' . ((int) $period - 1) . ' months');
+        $to   = $now;
+}
+$periodLabel = $period === 'custom'
+    ? $from->format('d M Y') . ' - ' . $to->format('d M Y')
+    : $periods[$period] . ($period === 'sy' || $period === 'lsy' ? ' (' . $from->format('M Y') . ' - ' . $to->format('M Y') . ')' : '');
+
+Stats::setFilters($_GET);
+$f = Stats::filters();
+
+// current filters, kept in every link
+$params = array_filter([
+    'group'    => $f['group'] ?: null,
+    'model'    => $f['model'] ?: null,
+    'location' => $f['location'] ?: null,
+    'period'   => $period !== '12' ? $period : null,
+    'from'     => $period === 'custom' ? $from->format('Y-m-d') : null,
+    'to'       => $period === 'custom' ? $to->format('Y-m-d') : null,
+    'days'     => $days !== 30 ? $days : null,
+], static fn($v) => $v !== null);
+$link = static fn(array $extra = []): string => $self . '?' . http_build_query(array_merge($params, $extra));
+
+$listKind = $view === 'overdue' ? 'loaned' : $view;
+$listMin  = $view === 'overdue' ? $days : 0;
 
 /* ------------------------------------------------------------------ CSV */
 if (($_GET['export'] ?? '') === 'csv') {
-    $rows = Stats::listOf($view);
+    $rows = Stats::listOf($listKind, $listMin);
     $file = 'loan-devices-' . $view . '-' . date('Y-m-d') . '.csv';
     header('Content-Type: text/csv; charset=UTF-8');
     header('Content-Disposition: attachment; filename="' . $file . '"');
@@ -43,8 +112,9 @@ Html::header('Loan Dashboard', '', 'tools', Menu::class);
 
 $e   = static fn($s): string => htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8');
 $t   = Stats::totals();
-$mon = Stats::monthly($months);
-$rows = Stats::listOf($view);
+$mon = Stats::monthlyRange($from, $to);
+$rows = Stats::listOf($listKind, $listMin);
+$overdue = Stats::overdueCount($days);
 $pool = Stats::pool();
 $isAdmin = Session::haveRight('config', UPDATE);
 $cfgUrl  = $CFG_GLPI['root_doc'] . '/plugins/loandashboard/front/config.form.php';
@@ -71,6 +141,8 @@ echo <<<CSS
 .ld-table td, .ld-table th { white-space: nowrap; }
 .ld-days-warn { color: #f59f00; font-weight: 600; }
 .ld-days-bad { color: #d63939; font-weight: 600; }
+.ld-filters .form-label { font-size: .75rem; margin-bottom: 2px; opacity: .75; }
+.ld-chip { display:inline-flex; align-items:center; gap:4px; padding: 2px 10px; border-radius: 999px; background: var(--tblr-primary-lt, #e8f0fb); font-size: .8rem; }
 @media print { .ld-noprint, .navbar, aside, header { display:none !important; } }
 </style>
 CSS;
@@ -78,19 +150,57 @@ CSS;
 echo '<div class="container-fluid ld-wrap mt-3">';
 
 /* header */
+$opt = static function (array $items, int|string $selected, string $all = '') use ($e): string {
+    $h = $all !== '' ? '<option value="0">' . $e($all) . '</option>' : '';
+    foreach ($items as $k => $label) {
+        $h .= '<option value="' . $e($k) . '"' . ((string) $k === (string) $selected ? ' selected' : '') . '>' . $e($label) . '</option>';
+    }
+    return $h;
+};
+
 echo '<div class="d-flex flex-wrap align-items-center gap-2 mb-3">'
     . '<h2 class="m-0 me-auto"><i class="ti ti-chart-pie me-2"></i>Loan Dashboard</h2>'
-    . '<form method="get" action="' . $e($self) . '" class="d-flex gap-2 ld-noprint">'
-    . '<input type="hidden" name="view" value="' . $e($view) . '">'
-    . '<select name="months" class="form-select" onchange="this.form.submit()">';
-foreach ([3, 6, 12, 24] as $m) {
-    echo '<option value="' . $m . '"' . ($m === $months ? ' selected' : '') . '>Last ' . $m . ' months</option>';
-}
-echo '</select></form>'
-    . '<a class="btn btn-outline-secondary ld-noprint" href="' . $e($self . '?view=' . $view . '&export=csv') . '"><i class="ti ti-file-spreadsheet me-1"></i>Export CSV</a>'
+    . '<a class="btn btn-outline-secondary ld-noprint" href="' . $e($link(['view' => $view, 'export' => 'csv'])) . '"><i class="ti ti-file-spreadsheet me-1"></i>Export CSV</a>'
     . '<button class="btn btn-outline-secondary ld-noprint" onclick="window.print()"><i class="ti ti-printer me-1"></i>Print / PDF</button>';
 if ($isAdmin) {
     echo '<a class="btn btn-outline-secondary ld-noprint" href="' . $e($cfgUrl) . '" title="Settings"><i class="ti ti-settings"></i></a>';
+}
+echo '</div>';
+
+/* filter bar */
+echo '<div class="card mb-3 ld-filters ld-noprint"><div class="card-body py-2">'
+    . '<form method="get" action="' . $e($self) . '" class="row g-2 align-items-end" id="ld-filter-form">'
+    . '<input type="hidden" name="view" value="' . $e($view) . '">'
+    . '<div class="col-6 col-md-auto"><label class="form-label">Group</label><select name="group" class="form-select form-select-sm">'
+    . $opt(Stats::groupOptions(), $f['group'], 'Loan pool (settings)') . '</select></div>'
+    . '<div class="col-6 col-md-auto"><label class="form-label">Model</label><select name="model" class="form-select form-select-sm">'
+    . $opt(Stats::options('model'), $f['model'], 'All models') . '</select></div>'
+    . '<div class="col-6 col-md-auto"><label class="form-label">Location</label><select name="location" class="form-select form-select-sm">'
+    . $opt(Stats::options('location'), $f['location'], 'All locations') . '</select></div>'
+    . '<div class="col-6 col-md-auto"><label class="form-label">Period (charts)</label><select name="period" class="form-select form-select-sm" id="ld-period">'
+    . $opt($periods, $period) . '</select></div>'
+    . '<div class="col-6 col-md-auto ld-custom"><label class="form-label">From</label><input type="date" name="from" class="form-control form-control-sm" value="' . $e($from->format('Y-m-d')) . '"></div>'
+    . '<div class="col-6 col-md-auto ld-custom"><label class="form-label">To</label><input type="date" name="to" class="form-control form-control-sm" value="' . $e($to->format('Y-m-d')) . '"></div>'
+    . '<div class="col-6 col-md-auto"><label class="form-label">Overdue after (days)</label><input type="number" min="1" max="365" name="days" class="form-control form-control-sm" style="width:110px" value="' . (int) $days . '"></div>'
+    . '<div class="col-auto"><button class="btn btn-sm btn-primary"><i class="ti ti-filter me-1"></i>Apply</button>'
+    . ' <a class="btn btn-sm btn-link" href="' . $e($self) . '">Reset</a></div>'
+    . '</form></div></div>';
+
+/* active filters */
+$chips = [];
+if ($f['group'] > 0) {
+    $chips[] = 'Group: ' . (Stats::groupOptions()[$f['group']] ?? '#' . $f['group']);
+}
+if ($f['model'] > 0) {
+    $chips[] = 'Model: ' . (Stats::options('model')[$f['model']] ?? '#' . $f['model']);
+}
+if ($f['location'] > 0) {
+    $chips[] = 'Location: ' . (Stats::options('location')[$f['location']] ?? '#' . $f['location']);
+}
+$chips[] = 'Period: ' . $periodLabel;
+echo '<div class="d-flex flex-wrap gap-2 mb-3">';
+foreach ($chips as $c) {
+    echo '<span class="ld-chip"><i class="ti ti-filter"></i>' . $e($c) . '</span>';
 }
 echo '</div>';
 
@@ -110,10 +220,13 @@ $kpis = [
 ];
 echo '<div class="ld-kpi mb-3">';
 foreach ($kpis as [$k, $label, $num, $color, $icon]) {
-    echo '<a href="' . $e($self . '?view=' . $k . '&months=' . $months) . '"><div class="card' . ($view === $k ? ' active' : '') . '" style="--c:' . $color . '"><div class="card-body">'
+    echo '<a href="' . $e($link(['view' => $k])) . '"><div class="card' . ($view === $k ? ' active' : '') . '" style="--c:' . $color . '"><div class="card-body">'
         . '<div class="d-flex justify-content-between"><div class="lbl">' . $e($label) . '</div><i class="ti ' . $icon . '" style="color:' . $color . ';font-size:1.4rem"></i></div>'
         . '<div class="num">' . (int) $num . '</div></div></div></a>';
 }
+echo '<a href="' . $e($link(['view' => 'overdue'])) . '"><div class="card' . ($view === 'overdue' ? ' active' : '') . '" style="--c:#f76707"><div class="card-body">'
+    . '<div class="d-flex justify-content-between"><div class="lbl">On loan &gt; ' . (int) $days . ' days</div><i class="ti ti-clock-exclamation" style="color:#f76707;font-size:1.4rem"></i></div>'
+    . '<div class="num">' . (int) $overdue . '</div></div></div></a>';
 echo '<div><div class="card" style="--c:#f59f00"><div class="card-body"><div class="d-flex justify-content-between"><div class="lbl">In use</div><i class="ti ti-gauge" style="color:#f59f00;font-size:1.4rem"></i></div>'
     . '<div class="num">' . (int) $t['utilisation'] . '%</div><div class="small text-muted">on loan of all working devices</div></div></div></div>';
 echo '</div>';
@@ -142,7 +255,7 @@ echo '<div class="row g-3 mb-3">'
 
 /* monthly */
 echo '<div class="card mb-3"><div class="card-header"><h3 class="card-title">Loans, returns and damage per month</h3>'
-    . '<div class="card-subtitle ms-2 text-muted">from the status history</div></div><div class="card-body">'
+    . '<div class="card-subtitle ms-2 text-muted">' . $e($periodLabel) . ' - from the status history</div></div><div class="card-body">'
     . Chart::monthly($mon['labels'], [
         ['Loaned out', Chart::COLORS['loaned'], $mon['loaned']],
         ['Returned', Chart::COLORS['available'], $mon['available']],
@@ -155,7 +268,7 @@ echo '<div class="card mb-3"><div class="card-header flex-wrap gap-2">'
     . '<h3 class="card-title me-auto">' . $e($views[$view]) . ' <span class="badge bg-secondary-lt ms-1">' . count($rows) . '</span></h3>'
     . '<div class="btn-group ld-noprint" role="group">';
 foreach ($views as $k => $label) {
-    echo '<a class="btn btn-sm ' . ($k === $view ? 'btn-primary' : 'btn-outline-secondary') . '" href="' . $e($self . '?view=' . $k . '&months=' . $months) . '">' . $e($label) . '</a>';
+    echo '<a class="btn btn-sm ' . ($k === $view ? 'btn-primary' : 'btn-outline-secondary') . '" href="' . $e($link(['view' => $k])) . '">' . $e($label) . '</a>';
 }
 echo '</div><input type="search" class="form-control form-control-sm ld-noprint" style="max-width:220px" placeholder="Search..." oninput="ldFilter(this.value)"></div>';
 
@@ -166,17 +279,16 @@ if ($rows === []) {
         . '<th>Device</th><th>Serial number</th><th>Model</th><th>Status</th><th>User</th><th>Student e-mail</th><th>Location</th><th>Since</th><th>Days</th>'
         . '</tr></thead><tbody>';
     foreach ($rows as $r) {
-        $days = $r['days'];
         $cls  = '';
-        if ($r['kind'] === 'loaned' && $days !== null) {
-            $cls = $days > 60 ? 'ld-days-bad' : ($days > 30 ? 'ld-days-warn' : '');
+        if ($r['kind'] === 'loaned' && $r['days'] !== null) {
+            $cls = $r['days'] > 2 * $days ? 'ld-days-bad' : ($r['days'] > $days ? 'ld-days-warn' : '');
         }
         echo '<tr><td><a href="' . $e($compUrl . $r['id']) . '">' . $e($r['name'] !== '' ? $r['name'] : '#' . $r['id']) . '</a></td>'
             . '<td>' . $e($r['serial']) . '</td><td>' . $e($r['model']) . '</td>'
             . '<td><span class="ld-dot" style="background:' . Chart::COLORS[$r['kind']] . '"></span>' . $e($r['state']) . '</td>'
             . '<td>' . $e($r['user']) . '</td><td>' . $e($r['email']) . '</td><td>' . $e($r['location']) . '</td>'
             . '<td>' . $e($r['since'] !== '' ? substr($r['since'], 0, 10) : '-') . '</td>'
-            . '<td class="' . $cls . '">' . ($days !== null ? (int) $days : '-') . '</td></tr>';
+            . '<td class="' . $cls . '">' . ($r['days'] !== null ? (int) $r['days'] : '-') . '</td></tr>';
     }
     echo '</tbody></table></div>';
 }
@@ -190,7 +302,7 @@ if ($mon['top'] !== []) {
         $serial = $pool[$id]['serial'] ?? '';
         $top[$name . ($serial !== '' ? ' (' . $serial . ')' : '')] = $n;
     }
-    echo '<div class="card mb-3"><div class="card-header"><h3 class="card-title">Most loaned devices - last ' . $months . ' months</h3></div><div class="card-body">'
+    echo '<div class="card mb-3"><div class="card-header"><h3 class="card-title">Most loaned devices - ' . $e($periodLabel) . '</h3></div><div class="card-body">'
         . Chart::hbars($top)
         . '</div></div>';
 }
@@ -199,6 +311,13 @@ echo '</div>';
 
 echo <<<JS
 <script>
+(function () {
+    var sel = document.getElementById('ld-period');
+    function toggle() {
+        document.querySelectorAll('.ld-custom').forEach(function (el) { el.style.display = sel && sel.value === 'custom' ? '' : 'none'; });
+    }
+    if (sel) { sel.addEventListener('change', toggle); toggle(); }
+})();
 function ldFilter(q) {
     q = (q || '').toLowerCase();
     document.querySelectorAll('#ld-table tbody tr').forEach(function (tr) {

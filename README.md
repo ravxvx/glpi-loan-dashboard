@@ -4,17 +4,18 @@ Dashboard and reports for **school loan devices** in GLPI: how many devices are 
 
 Tested on **GLPI 12.0.1** (works on GLPI 11.0+ / 12.x, PHP 8.2+).
 
-**Download:** [`loandashboard-1.0.0.tar.gz`](https://github.com/ravxvx/glpi-loan-dashboard/raw/main/dist/loandashboard-1.0.0.tar.gz) – ready to upload in [GLPI Plugin Uploader](https://github.com/ravxvx/glpi-plugin-uploader) or to extract into the GLPI plugins folder.
+**Download:** [`loandashboard-1.1.0.tar.gz`](https://github.com/ravxvx/glpi-loan-dashboard/raw/main/dist/loandashboard-1.1.0.tar.gz) – ready to upload in [GLPI Plugin Uploader](https://github.com/ravxvx/glpi-plugin-uploader) or to extract into the GLPI plugins folder.
 
 ![Loan Dashboard](screenshots/dashboard.png)
 
 ## Features
 
 - **Tools → Loan Dashboard** page:
-  - tiles: loan devices, on loan, available, damaged, % in use
+  - **filters for the whole page** (tiles, charts, list and CSV): group, model, location, period – last 3 / 6 / 12 / 24 months, **this / last school year** (1 Sep – 30 Jun) or **custom dates** – and the *overdue* limit in days
+  - tiles: loan devices, on loan, available, damaged, **on loan longer than X days**, % in use
   - donut chart by status, bars by model
-  - **loans, returns and damage per month** (last 3 / 6 / 12 / 24 months) – from GLPI's own status history
-  - list of devices **on loan / available / damaged / all** with user, student e-mail (Fields plugin), location, status date and **days on loan** (orange after 30, red after 60 days)
+  - **loans, returns and damage per month** for the selected period – from GLPI's own status history
+  - list of devices **on loan / available / damaged / all** with user, student e-mail (Fields plugin), location, status date and **days on loan** (orange after the overdue limit, red after twice the limit)
   - most loaned devices
   - **Export CSV** (opens in Excel) and **Print / PDF**
 - **Cards for GLPI's own dashboard** (Home → Dashboard → edit → **+** → group *Loan devices*): summary, on loan, available, by status, by model, loans per month
@@ -46,7 +47,7 @@ Upload the archive with **GLPI Plugin Uploader**, then **Install** and **Enable*
 
 ```bash
 cd /var/www/glpi/marketplace        # or /var/www/glpi/plugins
-tar xzf loandashboard-1.0.0.tar.gz
+tar xzf loandashboard-1.1.0.tar.gz
 chown -R www-data:www-data loandashboard
 ```
 
